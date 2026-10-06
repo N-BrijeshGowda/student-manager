@@ -1,43 +1,42 @@
 import { useEffect, useState } from 'react';
+import { request, getToken, saveToken, clearToken } from './api.js';
+import LoginForm from './components/LoginForm.jsx';
 import Navbar from './components/Navbar.jsx';
 import StudentForm from './components/StudentForm.jsx';
 import StudentList from './components/StudentList.jsx';
+import VisitorDetails from './components/VisitorDetails.jsx';
 
-// Backend address comes from frontend/.env
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+// A visitor's just-added details are kept for this browser tab only
+const MY_DETAILS_KEY = 'studentManagerMyDetails';
 
-// Sends a request to the backend and returns the JSON answer.
-// Throws an Error with a readable message if anything goes wrong.
-async function request(path, options = {}) {
-  let response;
+function readMyDetails() {
   try {
-    response = await fetch(`${API_URL}${path}`, {
-      headers: { 'Content-Type': 'application/json' },
-      ...options,
-    });
-  } catch (networkError) {
-    console.error('Network error:', networkError.message);
-    throw new Error('Cannot reach the server. Is the backend running?');
+    const saved = sessionStorage.getItem(MY_DETAILS_KEY);
+    return saved ? JSON.parse(saved) : null;
+  } catch {
+    return null;
   }
+}
 
-  // Read the body as text first, then try to turn it into JSON
-  const text = await response.text();
-  let data = null;
-  if (text) {
-    try {
-      data = JSON.parse(text);
-    } catch (parseError) {
-      console.error('Response was not valid JSON:', parseError.message);
+function storeMyDetails(student) {
+  try {
+    if (student) {
+      sessionStorage.setItem(MY_DETAILS_KEY, JSON.stringify(student));
+    } else {
+      sessionStorage.removeItem(MY_DETAILS_KEY);
     }
+  } catch {
+    // The details still show until the page is refreshed
   }
-
-  if (!response.ok) {
-    throw new Error((data && data.error) || `Request failed (status ${response.status})`);
-  }
-  return data;
 }
 
 function App() {
+  // Who is logged in: null for visitors, or { id, role: 'student' | 'admin', name, email }
+  const [user, setUser] = useState(null);
+  const [checkingLogin, setCheckingLogin] = useState(() => Boolean(getToken()));
+  const [showLogin, setShowLogin] = useState(false);
+  const [myDetails, setMyDetails] = useState(readMyDetails);
+
   const [students, setStudents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
@@ -46,42 +45,159 @@ function App() {
   const [banner, setBanner] = useState(null);
   const [deletingId, setDeletingId] = useState(null);
 
-  // READ: loads all students when the page opens (and again when reloadKey changes)
+  const userId = user ? user.id : null;
+  const userRole = user ? user.role : null;
+
+  // When the page opens with a saved token, ask the backend who it belongs to
   useEffect(() => {
+    if (!getToken()) {
+      return;
+    }
+    let ignore = false;
+    async function checkLogin() {
+      try {
+        const account = await request('/auth/me');
+        if (!ignore) {
+          setUser(account);
+        }
+      } catch (error) {
+        if (ignore) {
+          return;
+        }
+        if (error.status === 401) {
+          clearToken();
+        } else {
+          setBanner({ type: 'error', text: error.message });
+        }
+      } finally {
+        if (!ignore) {
+          setCheckingLogin(false);
+        }
+      }
+    }
+    checkLogin();
+    return () => {
+      ignore = true;
+    };
+  }, []);
+
+  // READ: loads all students once someone is logged in (and again when reloadKey changes)
+  useEffect(() => {
+    if (!userRole) {
+      return;
+    }
+    let ignore = false;
     async function loadStudents() {
+      setLoading(true);
       try {
         const data = await request('/students');
-        setStudents(data);
-        setLoadError('');
+        if (!ignore) {
+          setStudents(data);
+          setLoadError('');
+        }
       } catch (error) {
-        setLoadError(error.message);
+        if (!ignore && !handleAuthError(error)) {
+          setLoadError(error.message);
+        }
       } finally {
-        setLoading(false);
+        if (!ignore) {
+          setLoading(false);
+        }
       }
     }
     loadStudents();
-  }, [reloadKey]);
+    return () => {
+      ignore = true;
+    };
+    // handleAuthError only uses state setters, so it does not need to be listed
+  }, [userId, userRole, reloadKey]);
+
+  // Forgets the login and shows the given banner message
+  function logOut(message) {
+    clearToken();
+    setUser(null);
+    setStudents([]);
+    setLoading(true);
+    setEditingStudent(null);
+    setLoadError('');
+    setBanner(message);
+  }
+
+  // If the backend says the login is no longer valid, log out and ask to log in again.
+  // Returns true when the error was handled here.
+  function handleAuthError(error) {
+    if (error.status !== 401) {
+      return false;
+    }
+    logOut({ type: 'error', text: error.message });
+    setShowLogin(true);
+    return true;
+  }
 
   // Called by the "Try again" button when loading failed
   function handleRetry() {
-    setLoading(true);
     setReloadKey((current) => current + 1);
   }
 
-  // CREATE or UPDATE: returns an error message string, or null when it worked
-  async function handleSave(formData) {
+  // LOGIN: returns an error message string, or null when it worked
+  async function handleLogin(credentials) {
+    try {
+      const { token, user: account } = await request('/auth/login', {
+        method: 'POST',
+        body: JSON.stringify(credentials),
+      });
+      saveToken(token);
+      storeMyDetails(null);
+      setMyDetails(null);
+      setShowLogin(false);
+      setUser(account);
+      setBanner({ type: 'success', text: `Welcome, ${account.name}` });
+      return null;
+    } catch (error) {
+      return error.message;
+    }
+  }
+
+  // CREATE (visitor): saves the visitor's own details without logging in
+  async function handleAddMyDetails(formData) {
     setBanner(null);
     try {
-      if (editingStudent) {
-        const updated = await request(`/students/${editingStudent.id}`, {
+      const created = await request('/students', {
+        method: 'POST',
+        body: JSON.stringify(formData),
+      });
+      storeMyDetails(created);
+      setMyDetails(created);
+      setBanner({ type: 'success', text: 'Your details were saved' });
+      return null;
+    } catch (error) {
+      return error.message;
+    }
+  }
+
+  // CREATE or UPDATE (logged in): returns an error message string, or null when it worked.
+  // existing is the student being edited, or null to add a new one (admins only).
+  async function handleSave(formData, existing) {
+    setBanner(null);
+    try {
+      if (existing) {
+        const { token, ...updated } = await request(`/students/${existing.id}`, {
           method: 'PUT',
           body: JSON.stringify(formData),
         });
+        // After you change your own password the old token stops working; keep the new one
+        if (token) {
+          saveToken(token);
+        }
         setStudents((current) =>
           current.map((student) => (student.id === updated.id ? updated : student))
         );
-        setEditingStudent(null);
-        setBanner({ type: 'success', text: 'Student updated successfully' });
+        // Close the edit form, unless the admin already switched to another student
+        setEditingStudent((current) => (current && current.id === updated.id ? null : current));
+        if (userRole === 'student') {
+          setUser((current) => ({ ...current, name: updated.name, email: updated.email }));
+        }
+        setBanner({ type: 'success', text: 'Details updated successfully' });
       } else {
         const created = await request('/students', {
           method: 'POST',
@@ -92,18 +208,19 @@ function App() {
       }
       return null;
     } catch (error) {
+      handleAuthError(error);
       return error.message;
     }
   }
 
-  // Fills the form with the chosen student and scrolls up to it
+  // Fills the form with the chosen student and scrolls up to it (admins only)
   function handleEdit(student) {
     setBanner(null);
     setEditingStudent(student);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
-  // DELETE: asks for confirmation first, then removes the student
+  // DELETE: asks for confirmation first, then removes the student (admins only)
   async function handleDelete(student) {
     const confirmed = window.confirm(`Delete ${student.name}? This cannot be undone.`);
     if (!confirmed) {
@@ -120,15 +237,136 @@ function App() {
       }
       setBanner({ type: 'success', text: 'Student deleted successfully' });
     } catch (error) {
-      setBanner({ type: 'error', text: error.message });
+      if (!handleAuthError(error)) {
+        setBanner({ type: 'error', text: error.message });
+      }
     } finally {
       setDeletingId(null);
     }
   }
 
+  // What a visitor (not logged in) sees: the add form, their saved details, or the login form
+  function renderVisitorView() {
+    if (showLogin) {
+      return (
+        <LoginForm
+          initialEmail={myDetails ? myDetails.email : ''}
+          onLogin={handleLogin}
+          onCancel={() => setShowLogin(false)}
+        />
+      );
+    }
+    if (myDetails) {
+      return (
+        <VisitorDetails
+          student={myDetails}
+          onLoginClick={() => setShowLogin(true)}
+          onClear={() => {
+            storeMyDetails(null);
+            setMyDetails(null);
+            setBanner(null);
+          }}
+        />
+      );
+    }
+    return (
+      <>
+        <StudentForm
+          key="visitor"
+          title="Add Your Details"
+          submitLabel="Save My Details"
+          student={null}
+          passwordRequired
+          passwordLabel="Password * (to log in later)"
+          onSave={handleAddMyDetails}
+        />
+        <p className="hint">
+          Already added your details?{' '}
+          <button type="button" className="link-button" onClick={() => setShowLogin(true)}>
+            Log in
+          </button>{' '}
+          to see other students and edit your details.
+        </p>
+      </>
+    );
+  }
+
+  // What a logged-in student sees: their own editable details and the read-only list
+  function renderStudentView() {
+    const myRecord = students.find((student) => student.id === user.id);
+    return (
+      <>
+        {myRecord && (
+          <StudentForm
+            key={myRecord.id}
+            title="My Details"
+            submitLabel="Update My Details"
+            student={myRecord}
+            passwordRequired={false}
+            askCurrentPassword
+            passwordLabel="New password (optional)"
+            onSave={(formData) => handleSave(formData, myRecord)}
+          />
+        )}
+        {renderList()}
+      </>
+    );
+  }
+
+  // What an admin sees: add/edit form for any student and the full list with actions
+  function renderAdminView() {
+    return (
+      <>
+        {/* The key makes React rebuild the form when we switch between add and edit */}
+        <StudentForm
+          key={editingStudent ? editingStudent.id : 'new'}
+          title={editingStudent ? 'Edit Student' : 'Add Student'}
+          submitLabel={editingStudent ? 'Update Student' : 'Add Student'}
+          student={editingStudent}
+          passwordRequired={false}
+          passwordLabel={
+            editingStudent ? 'New password (optional)' : 'Password (optional, lets them log in)'
+          }
+          onSave={(formData) => handleSave(formData, editingStudent)}
+          onCancel={editingStudent ? () => setEditingStudent(null) : undefined}
+        />
+        {renderList()}
+      </>
+    );
+  }
+
+  function renderList() {
+    return (
+      <StudentList
+        students={students}
+        currentUser={user}
+        loading={loading}
+        error={loadError}
+        onRetry={handleRetry}
+        onEdit={handleEdit}
+        onDelete={handleDelete}
+        deletingId={deletingId}
+      />
+    );
+  }
+
+  function renderView() {
+    if (checkingLogin) {
+      return <p className="status">Checking your login...</p>;
+    }
+    if (!user) {
+      return renderVisitorView();
+    }
+    return user.role === 'admin' ? renderAdminView() : renderStudentView();
+  }
+
   return (
     <>
-      <Navbar />
+      <Navbar
+        user={user}
+        onLoginClick={checkingLogin || showLogin ? undefined : () => setShowLogin(true)}
+        onLogout={() => logOut({ type: 'success', text: 'You have logged out' })}
+      />
       <main className="container">
         {banner && (
           <div className={`banner ${banner.type}`} role="status">
@@ -144,23 +382,7 @@ function App() {
           </div>
         )}
 
-        {/* The key makes React rebuild the form when we switch between add and edit */}
-        <StudentForm
-          key={editingStudent ? editingStudent.id : 'new'}
-          editingStudent={editingStudent}
-          onSave={handleSave}
-          onCancel={() => setEditingStudent(null)}
-        />
-
-        <StudentList
-          students={students}
-          loading={loading}
-          error={loadError}
-          onRetry={handleRetry}
-          onEdit={handleEdit}
-          onDelete={handleDelete}
-          deletingId={deletingId}
-        />
+        {renderView()}
       </main>
     </>
   );
